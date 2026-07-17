@@ -1,0 +1,16 @@
+**/.git
+**/.github
+**/.vscode
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
+**/node_modules
+**/.next
+**/out
+**/dist
+**/build
+**/.venv
+**/__pycache__
+Dockerfile*
+README.md
