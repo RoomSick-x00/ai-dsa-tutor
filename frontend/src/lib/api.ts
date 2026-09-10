@@ -2,6 +2,38 @@ import type { ChatRequest, StreamEvent, TutorMode } from "./types";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || (process.env.NODE_ENV === "production" ? "" : "http://localhost:8000")).replace(/\/$/, "");
 
+/** Calm, on-brand message shown whenever the model or backend is unavailable. */
+export const TUTOR_BUSY_MESSAGE =
+  "The tutor is a bit busy right now — try again in a moment.";
+
+const TUTOR_OFFLINE_MESSAGE =
+  "Can't reach the tutor right now — make sure the backend is running and try again.";
+
+const TUTOR_CLASSIFY_MESSAGE =
+  "Couldn't figure out the best mode — try picking one from the menu.";
+
+/** Map raw fetch/Gemini/backend failures to user-facing copy (technical detail stays in console). */
+export function toFriendlyError(err: unknown, context: "chat" | "classify" | "health" = "chat"): string {
+  const raw = err instanceof Error ? err.message : String(err);
+
+  if (/502|503|504|429|high demand|overloaded|rate limit|resource exhausted|quota|unavailable/i.test(raw)) {
+    return TUTOR_BUSY_MESSAGE;
+  }
+  if (/network error|failed to fetch|cannot reach|ECONNREFUSED|fetch failed|reach backend|reach the tutor/i.test(raw)) {
+    return TUTOR_OFFLINE_MESSAGE;
+  }
+  if (/stream interrupted|complete response|crashed mid-request|sse error/i.test(raw)) {
+    return TUTOR_BUSY_MESSAGE;
+  }
+  if (context === "classify" || /classification/i.test(raw)) {
+    return TUTOR_CLASSIFY_MESSAGE;
+  }
+  if (context === "health") {
+    return TUTOR_OFFLINE_MESSAGE;
+  }
+  return TUTOR_BUSY_MESSAGE;
+}
+
 const HINT_TAG_RE = /\[HINT_ADVANCED:(true|false)\]/gi;
 const PATTERN_TAG_RE = /\[PATTERN:[^\]]+\]/gi;
 
@@ -55,9 +87,10 @@ export async function checkBackendHealth(): Promise<{
   try {
     const response = await fetch(`${API_URL}/health`, { method: "GET" });
     if (!response.ok) {
+      console.error("[checkBackendHealth] HTTP error:", response.status);
       return {
         ok: false,
-        detail: `Backend health check failed: HTTP ${response.status}`,
+        detail: TUTOR_OFFLINE_MESSAGE,
       };
     }
     const data = (await response.json()) as {
@@ -70,10 +103,10 @@ export async function checkBackendHealth(): Promise<{
       detail: `Backend reachable — API key ${data.api_key ?? "unknown"}, model ${data.model ?? "unknown"}`,
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    console.error("[checkBackendHealth] unreachable:", { url: API_URL, error: err });
     return {
       ok: false,
-      detail: `Cannot reach backend at ${API_URL}: ${message}. Is uvicorn running on port 8000?`,
+      detail: toFriendlyError(err, "health"),
     };
   }
 }
@@ -86,7 +119,9 @@ export async function classifyIntent(message: string): Promise<TutorMode> {
   });
 
   if (!response.ok) {
-    throw new Error(`Classification failed: ${await parseErrorResponse(response)}`);
+    const detail = await parseErrorResponse(response);
+    console.error("[classifyIntent] HTTP error:", { status: response.status, detail });
+    throw new Error(toFriendlyError(detail, "classify"));
   }
 
   const result = (await response.json()) as { mode?: string };
@@ -98,7 +133,8 @@ export async function classifyIntent(message: string): Promise<TutorMode> {
     "mock_interview",
   ];
   if (!result.mode || !validModes.includes(result.mode as TutorMode)) {
-    throw new Error("Classification returned an unknown mode");
+    console.error("[classifyIntent] unknown mode:", result.mode);
+    throw new Error(TUTOR_CLASSIFY_MESSAGE);
   }
   return result.mode as TutorMode;
 }
@@ -120,13 +156,8 @@ export async function streamChat(
       signal,
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
     console.error("[streamChat] Network failure:", { url, error: err });
-    throw new Error(
-      `Network error reaching ${url}: ${message}. ` +
-        `Confirm the FastAPI backend is running (uvicorn main:app --reload --port 8000) ` +
-        `and CORS allows ${typeof window !== "undefined" ? window.location.origin : "localhost:3000"}.`
-    );
+    throw new Error(toFriendlyError(err, "chat"));
   }
 
   if (!response.ok) {
@@ -136,7 +167,7 @@ export async function streamChat(
       status: response.status,
       detail,
     });
-    throw new Error(`Backend error (${response.status}): ${detail}`);
+    throw new Error(toFriendlyError(`${response.status}: ${detail}`, "chat"));
   }
 
   const reader = response.body?.getReader();
@@ -164,7 +195,7 @@ export async function streamChat(
       onDone(event);
     } else if (event.type === "error") {
       console.error("[streamChat] SSE error event:", event.message);
-      throw new Error(event.message);
+      throw new Error(toFriendlyError(event.message, "chat"));
     }
   };
 
@@ -187,14 +218,12 @@ export async function streamChat(
     }
   } catch (err) {
     if ((err as Error).name === "AbortError") throw err;
-    const message = err instanceof Error ? err.message : String(err);
     console.error("[streamChat] Stream read failure:", { url, error: err });
-    throw new Error(`Stream interrupted: ${message}`);
+    throw new Error(toFriendlyError(err, "chat"));
   }
 
   if (!receivedDone) {
-    throw new Error(
-      "Stream ended before a complete response — the backend may have crashed mid-request. Check the uvicorn terminal for errors."
-    );
+    console.error("[streamChat] Stream ended without done event:", { url });
+    throw new Error(TUTOR_BUSY_MESSAGE);
   }
 }

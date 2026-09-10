@@ -396,11 +396,39 @@
   max-width: 800px;
   margin: 0 auto 12px;
   padding: 10px 14px;
-  border-radius: 6px;
-  background: rgba(248, 81, 73, 0.12);
-  border: 1px solid #f85149;
-  color: #f85149;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
   font-size: 14px;
+  line-height: 1.45;
+}
+
+.historyEmpty {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.historyTitle {
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.historyMeta {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.newChatBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Claude-style Unified Input Container */
@@ -557,6 +585,21 @@
   font-size: 11px;
   line-height: 1.4;
   margin-top: 2px;
+}
+
+.modeMenuItemDisabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.modeMenuItemDisabled:hover,
+.modeMenuItemDisabled:focus-visible {
+  background: transparent;
+}
+
+.interviewDone {
+  color: var(--accent-hint);
+  font-style: normal;
 }
 
 .sendBtn {

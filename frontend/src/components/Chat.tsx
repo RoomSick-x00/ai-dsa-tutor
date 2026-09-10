@@ -49,11 +49,8 @@ const SITUATION_CARDS: { mode: TutorMode; title: string; description: string }[]
 
 const INTERVIEW_PHASE_SECONDS = 15 * 60;
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
 function formatRemaining(seconds: number) {
+
   const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
   const remainder = (seconds % 60).toString().padStart(2, "0");
   return `${minutes}:${remainder}`;
@@ -63,25 +60,108 @@ function normalizeTutorText(text: string) {
   return text.replace(/\$/g, "").replace(/\\/g, "").trim();
 }
 
+import {
+  ACTIVE_SESSION_STORAGE_KEY,
+  SHARED_MODES,
+  loadSessions,
+  saveSessions,
+  titleForSession,
+  type TutorSession,
+} from "@/lib/sessions";
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
 export default function Chat() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+
   const [isStreaming, setIsStreaming] = useState(false);
   const [isClassifying, setIsClassifying] = useState(false);
-  const [hasStarted, setHasStarted] = useState(false);
-  const [selectedMode, setSelectedMode] = useState<TutorMode | null>(null);
-  const [detectedMode, setDetectedMode] = useState<TutorMode | null>(null);
-  const [modeSuggestion, setModeSuggestion] = useState<TutorMode | null>(null);
+  const [sessions, setSessions] = useState<TutorSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
-  const [hintLevel, setHintLevel] = useState(1);
-  const [firstHintDelivered, setFirstHintDelivered] = useState(false);
-  const [mockInterview, setMockInterview] = useState<{ phase: MockInterviewPhase; startedAt: number }>({
-    phase: "Clarifying Questions",
-    startedAt: Date.now(),
-  });
-  const [secondsRemaining, setSecondsRemaining] = useState(INTERVIEW_PHASE_SECONDS);
   const [error, setError] = useState<string | null>(null);
   const [, setBackendStatus] = useState<string | null>(null);
+
+  const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
+
+  const updateActiveSession = (updater: (prev: TutorSession) => TutorSession) => {
+    if (!activeSessionId) return;
+    setSessions((prev) => prev.map((s) => (s.id === activeSessionId ? updater(s) : s)));
+  };
+
+  const createSession = (mode: TutorMode): TutorSession => ({
+    id: uid(),
+    createdAt: Date.now(),
+    mode,
+    messages: [],
+    hintLevel: 1,
+    firstHintDelivered: false,
+    hasStarted: false,
+    detectedMode: null,
+    modeSuggestion: null,
+    mockInterview: { phase: "Clarifying Questions", startedAt: Date.now() },
+    secondsRemaining: INTERVIEW_PHASE_SECONDS,
+    interviewFinished: false,
+    sharedContextBackup: null,
+  });
+
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    // Restore persisted chat history (if any) before deciding to create a session.
+    const stored = loadSessions();
+    if (stored.length > 0) {
+      const storedActive = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+      const active =
+        stored.find((s) => s.id === storedActive && s.messages.length > 0) ??
+        stored.slice().sort((a, b) => b.createdAt - a.createdAt)[0];
+      // A mid-interview session can't be safely resumed across reloads (timers are stale);
+      // finish it so the mode lock doesn't strand the user.
+      const normalized = stored.map((s) =>
+        s.mode === "mock_interview" && s.hasStarted && !s.interviewFinished
+          ? { ...s, interviewFinished: true }
+          : s,
+      );
+      setSessions(normalized);
+      setActiveSessionId(active.id);
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    // Create initial session if none exists yet.
+    if (!hydrated || sessions.length > 0 || activeSessionId) return;
+    const initial = createSession("hint_ladder");
+    setSessions([initial]);
+    setActiveSessionId(initial.id);
+  }, [hydrated, activeSessionId, sessions.length]);
+
+  useEffect(() => {
+    // Persist chat history to localStorage whenever sessions change.
+    if (!hydrated) return;
+    saveSessions(sessions);
+    if (activeSessionId) {
+      window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeSessionId);
+    }
+  }, [hydrated, sessions, activeSessionId]);
+
+
+  const messages = activeSession?.messages ?? [];
+  const selectedMode = activeSession?.mode ?? null;
+  const detectedMode = activeSession?.detectedMode ?? null;
+  const modeSuggestion = activeSession?.modeSuggestion ?? null;
+  const hintLevel = activeSession?.hintLevel ?? 1;
+  const firstHintDelivered = activeSession?.firstHintDelivered ?? false;
+  const mockInterview =
+    activeSession?.mockInterview ??
+    { phase: "Clarifying Questions" as MockInterviewPhase, startedAt: Date.now() };
+  const secondsRemaining = activeSession?.secondsRemaining ?? INTERVIEW_PHASE_SECONDS;
+  const hasStarted = activeSession?.hasStarted ?? false;
+  const interviewFinished = activeSession?.interviewFinished ?? false;
+
+
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -92,6 +172,8 @@ export default function Chat() {
   const modeInfo = MODE_OPTIONS.find((option) => option.value === mode)!;
   const isComplexityChecker = hasStarted && mode === "complexity_checker";
   const isMockInterview = hasStarted && mode === "mock_interview";
+  // While an interview is running, other modes are locked until the timer finishes.
+  const interviewLocked = isMockInterview && !interviewFinished;
   const isLanding = !hasStarted;
 
   useEffect(() => {
@@ -112,12 +194,16 @@ export default function Chat() {
     if (!isMockInterview) return;
     const updateTimer = () => {
       const elapsed = Math.floor((Date.now() - mockInterview.startedAt) / 1000);
-      setSecondsRemaining(Math.max(0, INTERVIEW_PHASE_SECONDS - elapsed));
+      updateActiveSession((prev) => ({
+        ...prev,
+        secondsRemaining: Math.max(0, INTERVIEW_PHASE_SECONDS - elapsed),
+      }));
     };
     updateTimer();
     const timer = window.setInterval(updateTimer, 1000);
     return () => window.clearInterval(timer);
   }, [isMockInterview, mockInterview.startedAt]);
+
 
   useEffect(() => {
     if (!isModeMenuOpen) return;
@@ -153,16 +239,16 @@ export default function Chat() {
         content: stripTutorTags(message.content),
       }));
 
+      const nextMessages = [...messages];
       if (!isSystemAction) {
-        setMessages((previous) => [
-          ...previous,
-          { id: uid(), role: "user", content: trimmed },
-          { id: assistantId, role: "assistant", content: "" },
-        ]);
+        nextMessages.push({ id: uid(), role: "user", content: trimmed });
+        nextMessages.push({ id: assistantId, role: "assistant", content: "" });
         setInput("");
       } else {
-        setMessages((previous) => [...previous, { id: assistantId, role: "assistant", content: "" }]);
+        nextMessages.push({ id: assistantId, role: "assistant", content: "" });
       }
+      updateActiveSession((prev) => ({ ...prev, messages: nextMessages }));
+
       setIsStreaming(true);
 
       abortRef.current?.abort();
@@ -187,34 +273,54 @@ export default function Chat() {
           (token) => {
             streamed += token;
             const visibleContent = normalizeTutorText(streamed);
-            setMessages((previous) => previous.map((message) => (
-              message.id === assistantId ? { ...message, content: visibleContent } : message
-            )));
+            updateActiveSession((prev) => ({
+              ...prev,
+              messages: prev.messages.map((message) =>
+                message.id === assistantId ? { ...message, content: visibleContent } : message
+              ),
+            }));
           },
           (done) => {
             const finalContent = normalizeTutorText(done.content || streamed);
-            setMessages((previous) => previous.map((message) => (
-              message.id === assistantId ? { ...message, content: finalContent } : message
-            )));
+            updateActiveSession((prev) => ({
+              ...prev,
+              messages: prev.messages.map((message) =>
+                message.id === assistantId ? { ...message, content: finalContent } : message
+              ),
+            }));
+
             if (action === "next_hint" && done.hint_advanced === true) {
-              setHintLevel((level) => Math.min(level + 1, 4));
+              updateActiveSession((prev) => ({ ...prev, hintLevel: Math.min(prev.hintLevel + 1, 4) }));
             }
             if (activeMode === "hint_ladder" && action !== "next_hint" && finalContent) {
-              setFirstHintDelivered(true);
+              updateActiveSession((prev) => ({ ...prev, firstHintDelivered: true }));
             }
             if (done.mock_interview_phase) {
-              setMockInterview({ phase: done.mock_interview_phase, startedAt: Date.now() });
+              updateActiveSession((prev) => ({
+                ...prev,
+                mockInterview: {
+                  phase: done.mock_interview_phase as MockInterviewPhase,
+                  startedAt: Date.now(),
+                },
+                secondsRemaining: INTERVIEW_PHASE_SECONDS,
+              }));
               timedOutPhaseRef.current = null;
             }
+
           },
           abortRef.current.signal,
         );
+
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
           const message = err instanceof Error ? err.message : "Something went wrong";
           console.error("[Chat] sendMessage failed:", err);
           setError(message);
-          setMessages((previous) => previous.filter((item) => item.id !== assistantId));
+          updateActiveSession((prev) => ({
+            ...prev,
+            messages: prev.messages.filter((item) => item.id !== assistantId),
+          }));
+
         }
       } finally {
         setIsStreaming(false);
@@ -224,45 +330,131 @@ export default function Chat() {
   );
 
   const selectSituation = (nextMode: TutorMode) => {
-    setSelectedMode(nextMode);
     setError(null);
+    if (!activeSessionId) return;
+
+    // User explicitly starts a situation: refresh within the same session
+    // (but keep the existing session entry; do NOT create a new one here).
+    updateActiveSession((prev) => ({
+      ...prev,
+      mode: nextMode,
+      messages: [],
+      hasStarted: false,
+      detectedMode: null,
+      modeSuggestion: null,
+      hintLevel: nextMode === "hint_ladder" ? 1 : prev.hintLevel,
+      firstHintDelivered: nextMode === "hint_ladder" ? false : prev.firstHintDelivered,
+      mockInterview:
+        nextMode === "mock_interview"
+          ? { phase: "Clarifying Questions", startedAt: Date.now() }
+          : prev.mockInterview,
+      secondsRemaining:
+        nextMode === "mock_interview" ? INTERVIEW_PHASE_SECONDS : prev.secondsRemaining,
+    }));
+
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const changeMode = (nextMode: TutorMode) => {
     if (nextMode === selectedMode || isStreaming) return;
-    
-    // Bug 2 fix: Reset conversation state completely on mode switch
-    setSelectedMode(nextMode);
-    setMessages([]);
-    setHasStarted(false);
-    setDetectedMode(null);
-    setModeSuggestion(null);
+    if (interviewLocked && nextMode !== "mock_interview") return; // blocked while interview runs
+
     setError(null);
     setIsModeMenuOpen(false);
-    
-    if (nextMode === "hint_ladder") {
-      setHintLevel(1);
-      setFirstHintDelivered(false);
-    }
-    if (nextMode === "mock_interview") {
-      setMockInterview({ phase: "Clarifying Questions", startedAt: Date.now() });
-      timedOutPhaseRef.current = null;
-    }
+
+    updateActiveSession((prev) => {
+      if (nextMode === "mock_interview") {
+        // Entering an interview always starts completely fresh; the shared-context
+        // conversation (if any) is stashed so it can be resumed afterwards.
+        const backup =
+          SHARED_MODES.includes(prev.mode) && prev.messages.length > 0
+            ? {
+                mode: prev.mode,
+                messages: prev.messages,
+                hintLevel: prev.hintLevel,
+                firstHintDelivered: prev.firstHintDelivered,
+                hasStarted: prev.hasStarted,
+                detectedMode: prev.detectedMode,
+                modeSuggestion: prev.modeSuggestion,
+              }
+            : prev.sharedContextBackup;
+        return {
+          ...prev,
+          mode: "mock_interview",
+          messages: [],
+          hasStarted: true,
+          detectedMode: null,
+          modeSuggestion: null,
+          hintLevel: 1,
+          firstHintDelivered: false,
+          mockInterview: { phase: "Clarifying Questions", startedAt: Date.now() },
+          secondsRemaining: INTERVIEW_PHASE_SECONDS,
+          interviewFinished: false,
+          sharedContextBackup: backup,
+        };
+      }
+
+      // Moving to a shared-context mode after a finished interview: intentionally
+      // RESUME the stashed pre-interview conversation, now in the chosen mode.
+      if (prev.mode === "mock_interview" && prev.sharedContextBackup) {
+        const backup = prev.sharedContextBackup;
+        return {
+          ...prev,
+          mode: nextMode,
+          messages: backup.messages,
+          hintLevel: backup.hintLevel,
+          firstHintDelivered: backup.firstHintDelivered,
+          hasStarted: backup.hasStarted,
+          detectedMode: backup.detectedMode,
+          modeSuggestion: backup.modeSuggestion,
+          sharedContextBackup: null,
+        };
+      }
+
+      // Switching within the shared-context group: keep the conversation intact.
+      return { ...prev, mode: nextMode };
+    });
   };
 
-  useEffect(() => {
-    if (
-      !isMockInterview ||
-      isStreaming ||
-      secondsRemaining > 0 ||
-      mockInterview.phase === "Discussion" ||
-      timedOutPhaseRef.current === mockInterview.phase
-    ) return;
 
+
+  useEffect(() => {
+    if (!isMockInterview || isStreaming || secondsRemaining > 0) return;
+
+    // The final (Discussion) phase timer expiring means the whole interview is over —
+    // no further LLM call, just unlock mode switching.
+    if (mockInterview.phase === "Discussion") {
+      if (!interviewFinished) {
+        updateActiveSession((prev) => ({ ...prev, interviewFinished: true }));
+      }
+      return;
+    }
+
+    if (timedOutPhaseRef.current === mockInterview.phase) return;
     timedOutPhaseRef.current = mockInterview.phase;
     void sendMessage("", "phase_timeout");
-  }, [isMockInterview, isStreaming, mockInterview.phase, secondsRemaining, sendMessage]);
+  }, [isMockInterview, isStreaming, interviewFinished, mockInterview.phase, secondsRemaining, sendMessage]);
+
+  /** Saved chats shown in the sidebar (sessions with at least one message). */
+  const savedSessions = sessions
+    .filter((s) => s.messages.length > 0)
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt);
+
+  const startNewChat = () => {
+    if (interviewLocked) return;
+    setError(null);
+    setInput("");
+
+    // Active conversation with messages is already persisted via the sessions effect.
+    const fresh = createSession("hint_ladder");
+    setSessions((prev) => {
+      const cleaned = prev.filter((s) => s.id === activeSessionId || s.messages.length > 0);
+      return [fresh, ...cleaned];
+    });
+    setActiveSessionId(fresh.id);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
 
   const handleSubmit = async (event: React.FormEvent | React.KeyboardEvent) => {
     event.preventDefault();
@@ -275,7 +467,7 @@ export default function Chat() {
     }
 
     if (selectedMode) {
-      setHasStarted(true);
+      updateActiveSession((prev) => ({ ...prev, hasStarted: true }));
       await sendMessage(text, undefined, selectedMode);
       return;
     }
@@ -284,17 +476,22 @@ export default function Chat() {
     setError(null);
     try {
       const detected = await classifyIntent(text);
-      setDetectedMode(detected);
-      setModeSuggestion(detected);
-      setHasStarted(true);
+      updateActiveSession((prev) => ({
+        ...prev,
+        mode: detected, // ensure next message uses routed mode
+        detectedMode: detected,
+        modeSuggestion: detected,
+        hasStarted: true,
+      }));
       await sendMessage(text, undefined, detected);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Could not detect a tutoring mode";
+      const message = err instanceof Error ? err.message : "Couldn't figure out the best mode — try picking one from the menu.";
       setError(message);
     } finally {
       setIsClassifying(false);
     }
   };
+
 
   const inputPlaceholder = isLanding
     ? "YOUR DSA THINKING PARTNER — Choose a situation, or paste anything and I'll route you..."
@@ -310,13 +507,54 @@ export default function Chat() {
           <div className={styles.appLogo}>
             <h2>AI DSA Tutor</h2>
           </div>
-          <button className={styles.newChatBtn} onClick={() => window.location.reload()} title="New Chat">
+          <button
+            className={styles.newChatBtn}
+            onClick={startNewChat}
+            title={interviewLocked ? "Available after the interview ends" : "New chat"}
+            disabled={interviewLocked}
+            aria-label="New chat"
+          >
              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
           </button>
         </div>
         <div className={styles.sidebarContent}>
-          {/* Real chat history will be populated here later */}
+          <div className={styles.historySection}>
+            <h3>Session History</h3>
+            {savedSessions.length === 0 ? (
+              <p className={styles.historyEmpty}>No saved chats yet — start a conversation and it will appear here.</p>
+            ) : (
+              savedSessions.map((s) => {
+                  const active = s.id === activeSessionId;
+                  const modeLabel = MODE_OPTIONS.find((o) => o.value === s.mode)?.label ?? s.mode;
+                  const title = titleForSession(s);
+                  return (
+                    <div
+                      key={s.id}
+                      className={`${active ? styles.historyItemActive : styles.historyItem}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        setError(null);
+                        setActiveSessionId(s.id);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          setError(null);
+                          setActiveSessionId(s.id);
+                        }
+                      }}
+                      aria-current={active}
+                      title={`${title} · ${modeLabel}`}
+                    >
+                      <div className={styles.historyTitle}>{title}</div>
+                      <div className={styles.historyMeta}>{modeLabel}</div>
+                    </div>
+                  );
+                })
+            )}
+          </div>
         </div>
+
       </aside>
 
       <main className={styles.main}>
@@ -356,9 +594,15 @@ export default function Chat() {
                   : `detected: ${MODE_OPTIONS.find((option) => option.value === detectedMode)?.label.toLowerCase()} mode`}
               </div>
             )}
+
             {isMockInterview && (
               <div className={styles.phaseBar}>
-                <span>Phase: <strong>{mockInterview.phase}</strong></span>
+                <span>
+                  Phase: <strong>{mockInterview.phase}</strong>
+                  {interviewFinished && (
+                    <em className={styles.interviewDone}> — interview complete, modes unlocked</em>
+                  )}
+                </span>
                 <span className={styles.countdown}>{formatRemaining(secondsRemaining)}</span>
               </div>
             )}
@@ -445,17 +689,22 @@ export default function Chat() {
                   <div className={styles.modeMenu}>
                     {MODE_OPTIONS.map((option) => {
                       const isActive = option.value === mode;
+                      const isLocked = interviewLocked && option.value !== "mock_interview";
                       return (
                         <button
                           key={option.value}
                           type="button"
-                          className={`${styles.modeMenuItem} ${isActive ? styles.modeMenuItemActive : ""}`}
+                          className={`${styles.modeMenuItem} ${isActive ? styles.modeMenuItemActive : ""} ${isLocked ? styles.modeMenuItemDisabled : ""}`}
                           onClick={() => changeMode(option.value)}
+                          disabled={isLocked}
+                          title={isLocked ? "Available after the interview ends" : undefined}
                         >
                           <span className={styles.modeMenuLabel}>
                             {MODE_ICONS[option.value]} {option.label}
                           </span>
-                          <span className={styles.modeMenuDescription}>{option.description}</span>
+                          <span className={styles.modeMenuDescription}>
+                            {isLocked ? "Available after the interview ends" : option.description}
+                          </span>
                         </button>
                       );
                     })}

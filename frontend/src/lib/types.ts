@@ -21,6 +21,7 @@ export interface ChatRequest {
   mock_interview_timer_expired?: boolean;
 }
 
+
 export type MockInterviewPhase =
   | "Clarifying Questions"
   | "Coding"
