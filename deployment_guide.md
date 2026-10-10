@@ -1,112 +1,118 @@
-# AWS Elastic Beanstalk deployment guide
+# Deploying AI DSA Tutor to AWS Elastic Beanstalk
 
-## Prerequisites
+The application runs as one Docker container: Next.js is exported to static files during the image build and FastAPI serves both the API and the frontend. Elastic Beanstalk provisions and manages the EC2 instance, but the Docker image is stored in Amazon ECR.
 
-- An AWS account with access to Amazon ECR and Elastic Beanstalk.
-- An IAM principal with permissions to:
-  - AmazonECR-FullAccess (or equivalent ECR push/pull permissions)
-  - AWSElasticBeanstalkFullAccess (or equivalent Beanstalk service management)
-  - EC2 permissions (Beanstalk provisions EC2 instances and a load balancer on your behalf)
-  - Secrets Manager access if you plan to store the Gemini key as a secret
-- A Docker-enabled machine for local build and test.
-- The EB CLI installed locally (`pip install awsebcli`), or willingness to use the console instead.
-- A valid Gemini API key.
+Two deployment routes are supported:
 
-## 1. Create an ECR repository
+- **Manual Docker route:** build and push from your own computer, then deploy the image through Elastic Beanstalk.
+- **GitHub Actions route:** a push to `main` builds the same Docker image, pushes it to ECR, and asks Elastic Beanstalk to deploy it.
 
-1. Open Amazon ECR in the AWS console.
-2. Choose Create repository.
-3. Name it, for example `ai-dsa-tutor`.
-4. Keep the default settings unless your team has a preference.
-5. Save the repository URI (for example `123456789012.dkr.ecr.us-east-1.amazonaws.com/ai-dsa-tutor`).
+Both routes use the same `Dockerfile` and target the same Elastic Beanstalk application/environment. Use one route at a time for a given change to keep the deployed version clear.
 
-## 2. Authenticate Docker to ECR
+## One-time AWS setup
 
-Run the following from your local terminal:
+Choose one AWS region and replace the placeholders below with your own values.
 
-```powershell
-aws ecr get-login-password --region <aws-region> | docker login --username AWS --password-stdin <account-id>.dkr.ecr.<aws-region>.amazonaws.com
+```text
+AWS_REGION=ap-south-1
+ECR_REPOSITORY=ai-dsa-tutor
+EB_APPLICATION_NAME=ai-dsa-tutor
+EB_ENVIRONMENT_NAME=ai-dsa-tutor-prod
+EB_ARTIFACT_BUCKET=<globally-unique-eb-artifact-bucket>
 ```
 
-## 3. Build and push the image locally
+1. Create a private Amazon ECR repository named `ai-dsa-tutor`.
+2. Create an S3 bucket for Elastic Beanstalk version bundles in the same region. Do not make it public.
+3. In Elastic Beanstalk, create an application and a **Docker** environment. For a low-cost demo, choose **Single instance** and an instance size appropriate for your account (for example, `t3.micro` where available).
+4. In the environment's **Configuration → Updates, monitoring, and logging**, set a health check path of `/health`.
+5. In **Configuration → Software**, add the environment variables:
+   - `GEMINI_API_KEY` — the real Gemini API key.
+   - `GEMINI_MODEL` — optional; defaults to the application's configured model.
+6. Ensure the Elastic Beanstalk EC2 instance profile can pull the image from ECR. The managed `AmazonEC2ContainerRegistryReadOnly` policy is sufficient for that purpose.
 
-From the project root:
+The Gemini key stays in Elastic Beanstalk environment configuration; it is neither committed to Git nor baked into the Docker image.
+
+## Option A: manual Docker deployment
+
+Prerequisites: Docker and the AWS CLI are installed and authenticated to the AWS account.
+
+From the repository root, authenticate Docker to ECR, build the image, and push a uniquely tagged version:
 
 ```powershell
-docker build -t ai-dsa-tutor:latest .
-docker tag ai-dsa-tutor:latest <account-id>.dkr.ecr.<aws-region>.amazonaws.com/ai-dsa-tutor:latest
-docker push <account-id>.dkr.ecr.<aws-region>.amazonaws.com/ai-dsa-tutor:latest
+$region = "<aws-region>"
+$accountId = "<aws-account-id>"
+$repository = "ai-dsa-tutor"
+$tag = "manual-$(Get-Date -Format yyyyMMddHHmmss)"
+$registry = "$accountId.dkr.ecr.$region.amazonaws.com"
+
+aws ecr get-login-password --region $region |
+  docker login --username AWS --password-stdin $registry
+
+docker build -t "$registry/$repository`:$tag" .
+docker push "$registry/$repository`:$tag"
 ```
 
-## 4. Create a Dockerrun.aws.json file
-
-Elastic Beanstalk's single-container Docker platform needs a manifest telling it which image to pull and which port to expose. Create this file in your project root:
+Create a `Dockerrun.aws.json` file containing the exact image URI (or update the root manifest before packaging):
 
 ```json
 {
   "AWSEBDockerrunVersion": "1",
   "Image": {
-    "Name": "<account-id>.dkr.ecr.<aws-region>.amazonaws.com/ai-dsa-tutor:latest",
+    "Name": "<account-id>.dkr.ecr.<aws-region>.amazonaws.com/ai-dsa-tutor:<tag>",
     "Update": "true"
   },
-  "Ports": [
-    {
-      "ContainerPort": "8000"
-    }
-  ]
+  "Ports": [{ "ContainerPort": "8000" }]
 }
 ```
 
-## 5. Create the Elastic Beanstalk application and environment
-
-Using the console:
-
-1. Open AWS Elastic Beanstalk.
-2. Choose Create application.
-3. Give it a name, for example `ai-dsa-tutor`.
-4. Under Platform, choose **Docker** (single container).
-5. Under Application code, choose **Upload your code** and upload the `Dockerrun.aws.json` file from step 4.
-6. Choose a single-instance environment (no load balancer) if you want to minimize cost — under Configure more options → Capacity → Environment type, select **Single instance** instead of **Load balanced, auto scaling**.
-7. Under Software, add environment variables:
-   - `GEMINI_API_KEY` = your real Gemini API key
-   - `GEMINI_MODEL` = optional override, for example `gemini-2.0-flash`
-8. If you prefer not to expose the secret directly, create an AWS Secrets Manager secret and reference it from your application code instead of pasting the key into the console.
-9. Choose an instance type covered by the free tier, for example `t2.micro` or `t3.micro`, under Capacity settings.
-10. Choose Create environment and wait for it to finish provisioning.
-
-Alternatively, using the EB CLI from the project root:
+Zip that file by itself and upload it as a new Elastic Beanstalk application version in the console, then deploy that version to the environment. Alternatively, use the EB CLI after creating the environment:
 
 ```powershell
 eb init -p docker ai-dsa-tutor --region <aws-region>
-eb create ai-dsa-tutor-env --single --instance-type t2.micro
-eb setenv GEMINI_API_KEY=<your-key> GEMINI_MODEL=gemini-2.0-flash
+eb deploy <environment-name>
 ```
 
-## 6. Get the public URL
+## Option B: GitHub Actions deployment
 
-Once the environment is running (console shows a green "Health: Ok" status):
+The workflow at `.github/workflows/deploy.yml` publishes a commit-specific Docker image and deploys that exact image. It uses OpenID Connect (OIDC) instead of permanent AWS access keys.
 
-1. Open the Elastic Beanstalk environment dashboard.
-2. Copy the environment URL shown near the top of the page (for example `ai-dsa-tutor-env.<region>.elasticbeanstalk.com`).
-3. Open `https://<environment-url>/` to verify the frontend landing page.
-4. Open `https://<environment-url>/health` to verify the API.
-5. Open `https://<environment-url>/chat` and `https://<environment-url>/classify` with a POST request tool to confirm the endpoints respond.
+### Configure GitHub repository variables
 
-## 7. Verify the deployment
+In **Settings → Secrets and variables → Actions → Variables**, add:
 
-Use the deployed URL to check:
+| Variable | Value |
+| --- | --- |
+| `AWS_REGION` | The ECR/Elastic Beanstalk region, e.g. `ap-south-1` |
+| `ECR_REPOSITORY` | `ai-dsa-tutor` |
+| `EB_APPLICATION_NAME` | Your Elastic Beanstalk application name |
+| `EB_ENVIRONMENT_NAME` | Your Elastic Beanstalk environment name |
+| `EB_ARTIFACT_BUCKET` | The private S3 bucket created above |
 
-- `https://<environment-url>/` renders the landing screen.
-- `https://<environment-url>/health` returns JSON with the API status.
-- `https://<environment-url>/chat` accepts POST requests.
-- `https://<environment-url>/classify` accepts POST requests.
+In **Settings → Secrets and variables → Actions → Secrets**, add:
 
-## Cost notes
+| Secret | Value |
+| --- | --- |
+| `AWS_ROLE_ARN` | ARN of the GitHub Actions OIDC deployment role |
 
-Elastic Beanstalk itself has no additional charge, but it provisions underlying resources that do:
+### Create the AWS OIDC deployment role
 
-- A single EC2 instance (use a free-tier-eligible type such as `t2.micro` / `t3.micro` to stay within the free tier's monthly hour allowance).
-- Choosing **Single instance** environment type avoids the separate Elastic Load Balancer charge that a load-balanced environment would add.
-- Standard EBS storage for the instance's root volume, generally within free tier limits at small sizes.
+Create an IAM role trusted by GitHub's OIDC provider (`token.actions.githubusercontent.com`). Restrict its trust policy to this repository and the `main` branch. The role needs permission to:
 
-For a small demo or assignment deployment on a free-tier-eligible instance type, expect this to run at little to no cost within the free tier window. If you need to avoid ongoing cost, terminate the environment (not just stop the instance) when you are done testing, since Beanstalk environments don't have a simple "pause" button the way App Runner does.
+- obtain an ECR authorization token and push images to this one ECR repository;
+- upload deployment bundles to the one artifact S3 bucket;
+- create Elastic Beanstalk application versions and update the one environment;
+- pass the Elastic Beanstalk service role only if your account policy requires it.
+
+Avoid broad administrator permissions. AWS's IAM policy generator and the IAM Access Analyzer policy validation tool are useful for limiting the final policy to your account and resources.
+
+After those values are present, a push to `main` (or a manual **Run workflow** in GitHub Actions) deploys the app. The workflow waits until Elastic Beanstalk reports that the environment update is complete.
+
+## Verify and manage costs
+
+When Elastic Beanstalk is green, verify:
+
+- `https://<environment-url>/` loads the application.
+- `https://<environment-url>/health` returns status JSON.
+- A tutor request reaches the backend (requires `GEMINI_API_KEY`).
+
+Elastic Beanstalk itself has no extra service fee, but it creates billable AWS resources: EC2, EBS, ECR storage, S3 storage, and sometimes a load balancer. A **single-instance** environment avoids the load-balancer charge. Terminate the Elastic Beanstalk environment when it is no longer needed; stopping an EC2 instance alone is not sufficient because Beanstalk may replace it.

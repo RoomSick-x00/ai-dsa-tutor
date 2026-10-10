@@ -1,0 +1,90 @@
+name: Deploy AI DSA Tutor to Elastic Beanstalk
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ai-dsa-tutor-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EB_APPLICATION_NAME: ${{ vars.EB_APPLICATION_NAME }}
+  EB_ENVIRONMENT_NAME: ${{ vars.EB_ENVIRONMENT_NAME }}
+  EB_ARTIFACT_BUCKET: ${{ vars.EB_ARTIFACT_BUCKET }}
+
+jobs:
+  deploy:
+    name: Build, publish, and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      # This uses GitHub Actions OIDC, so no long-lived AWS keys are stored in GitHub.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sign in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and publish the Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            --tag "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Create Elastic Beanstalk application bundle
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          mkdir -p bundle
+          cat > bundle/Dockerrun.aws.json <<EOF
+          {
+            "AWSEBDockerrunVersion": "1",
+            "Image": {
+              "Name": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+              "Update": "true"
+            },
+            "Ports": [
+              { "ContainerPort": "8000" }
+            ]
+          }
+          EOF
+          (cd bundle && zip -r ../deploy-bundle.zip Dockerrun.aws.json)
+
+      - name: Deploy image to Elastic Beanstalk
+        env:
+          VERSION_LABEL: github-${{ github.sha }}-${{ github.run_number }}
+        run: |
+          S3_KEY="elastic-beanstalk/ai-dsa-tutor/$VERSION_LABEL.zip"
+          aws s3 cp deploy-bundle.zip "s3://$EB_ARTIFACT_BUCKET/$S3_KEY"
+          aws elasticbeanstalk create-application-version \
+            --application-name "$EB_APPLICATION_NAME" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket="$EB_ARTIFACT_BUCKET",S3Key="$S3_KEY" \
+            --process
+          aws elasticbeanstalk update-environment \
+            --environment-name "$EB_ENVIRONMENT_NAME" \
+            --version-label "$VERSION_LABEL"
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names "$EB_ENVIRONMENT_NAME"
