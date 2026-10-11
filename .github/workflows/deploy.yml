@@ -28,6 +28,18 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+      #testing purpose
+      
+      - name: Diagnose GitHub OIDC subject
+        shell: bash
+        run: |
+          TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value')
+          SUB=$(TOKEN="$TOKEN" python3 -c \
+            'import os,json,base64; print(json.loads(base64.urlsafe_b64decode(os.environ["TOKEN"].split(".")[1] + "==="))["sub"])')
+          echo "OIDC subject: $SUB"
 
       # This uses GitHub Actions OIDC, so no long-lived AWS keys are stored in GitHub.
       - name: Configure AWS credentials
