@@ -28,18 +28,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
-      #testing purpose
-      
-      - name: Diagnose GitHub OIDC subject
-        shell: bash
-        run: |
-          TOKEN=$(curl -sS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
-            | jq -r '.value')
-          SUB=$(TOKEN="$TOKEN" python3 -c \
-            'import os,json,base64; print(json.loads(base64.urlsafe_b64decode(os.environ["TOKEN"].split(".")[1] + "==="))["sub"])')
-          echo "OIDC subject: $SUB"
 
       # This uses GitHub Actions OIDC, so no long-lived AWS keys are stored in GitHub.
       - name: Configure AWS credentials
@@ -47,6 +35,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          retry-max-attempts: 1
 
       - name: Sign in to Amazon ECR
         id: ecr
@@ -86,7 +75,7 @@ jobs:
 
       - name: Deploy image to Elastic Beanstalk
         env:
-          VERSION_LABEL: github-${{ github.sha }}-${{ github.run_number }}
+          VERSION_LABEL: github-${{ github.sha }}-${{ github.run_number }}-${{ github.run_attempt }}
         run: |
           S3_KEY="elastic-beanstalk/ai-dsa-tutor/$VERSION_LABEL.zip"
           aws s3 cp deploy-bundle.zip "s3://$EB_ARTIFACT_BUCKET/$S3_KEY"
